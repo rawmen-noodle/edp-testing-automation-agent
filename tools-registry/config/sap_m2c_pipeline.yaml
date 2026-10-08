@@ -1,0 +1,74 @@
+# SAP Market-to-Cash (M2C) landing pipeline: entity catalog + runtime settings.
+# ${VAR} / ${VAR:-default} are resolved from the environment at load time.
+# Secrets are referenced by NAME only; values come from Key Vault (or env vars when secrets_provider=env).
+
+pipeline:
+  name: sap_m2c_landing
+  source_system: SAP_ECC
+  source_root: ${M2C_SOURCE_ROOT}          # e.g. /mnt/sap_outbound/m2c  or  \\fileserver\sap_outbound\m2c
+  secrets_provider: ${M2C_SECRETS_PROVIDER:-keyvault}   # keyvault | env
+  stability_seconds: ${M2C_STABILITY_SECONDS:-60}       # file must be quiet this long before pickup
+  trigger_suffix: ${M2C_TRIGGER_SUFFIX:-}  # e.g. ".done" when SAP writes a trigger file after the data file
+  post_success_action: none                # none | archive (moves file to <source_root>/processed)
+  archive_dir: processed
+  workers: 4
+  storage:
+    account_url: ${AZURE_STORAGE_ACCOUNT_URL:-}            # preferred: managed identity
+    connection_string_secret: ${M2C_STORAGE_SECRET_NAME:-} # alternative: Key Vault secret name
+    container: raw-landing-zone
+    quarantine_container: raw-quarantine
+    path_template: "sap/m2c/{entity}/load_date={load_date}/batch_id={batch_id}/{file_name}"
+    max_concurrency: 4
+    verify_mode: ${M2C_VERIFY_MODE:-metadata}   # metadata | full (re-downloads and re-hashes each blob)
+  abc:
+    dsn_secret: abc-postgres-dsn
+
+entities:
+  customer_master:
+    sap_table: KNA1
+    file_pattern: "KNA1_*.txt"
+    expected_columns: [MANDT, KUNNR, NAME1, LAND1, ORT01, KTOKD, ERDAT]
+    key_columns: [MANDT, KUNNR]
+    check_duplicate_keys: true
+    trailer: {prefix: TRL, row_count_field: 1}
+
+  sales_order_header:
+    sap_table: VBAK
+    file_pattern: "VBAK_*.txt"
+    expected_columns: [MANDT, VBELN, ERDAT, AUART, VKORG, VTWEG, KUNNR, NETWR, WAERK]
+    key_columns: [MANDT, VBELN]
+    check_duplicate_keys: true
+    trailer: {prefix: TRL, row_count_field: 1}
+    control_totals:
+      - {name: sum_netwr, column: NETWR, trailer_field: 2, tolerance: 0.00}
+
+  sales_order_item:
+    sap_table: VBAP
+    file_pattern: "VBAP_*.txt"
+    expected_columns: [MANDT, VBELN, POSNR, MATNR, KWMENG, VRKME, NETWR, WAERK]
+    key_columns: [MANDT, VBELN, POSNR]
+    trailer: {prefix: TRL, row_count_field: 1}
+    control_totals:
+      - {name: sum_netwr, column: NETWR, trailer_field: 2, tolerance: 0.00}
+      - {name: sum_kwmeng, column: KWMENG, trailer_field: 3, tolerance: 0.000}
+
+  billing_header:
+    sap_table: VBRK
+    file_pattern: "VBRK_*.txt"
+    encoding: cp1252                     # legacy code page export
+    expected_columns: [MANDT, VBELN, FKART, FKDAT, KUNRG, NETWR, MWSBK, WAERK]
+    key_columns: [MANDT, VBELN]
+    trailer: {prefix: TRL, row_count_field: 1}
+    control_totals:
+      - {name: sum_netwr, column: NETWR, trailer_field: 2, tolerance: 0.01}
+
+  ar_open_items:
+    sap_table: BSID
+    file_pattern: "BSID_*.txt"
+    expected_columns: [MANDT, BUKRS, KUNNR, BELNR, GJAHR, BUZEI, BUDAT, SHKZG, DMBTR, WAERS]
+    key_columns: [MANDT, BUKRS, BELNR, GJAHR, BUZEI]
+    allow_empty: true                    # an empty AR delta is a valid business outcome
+    max_bad_rows: 0
+    trailer: {prefix: TRL, row_count_field: 1}
+    control_totals:
+      - {name: sum_dmbtr, column: DMBTR, trailer_field: 2, tolerance: 0.00}
